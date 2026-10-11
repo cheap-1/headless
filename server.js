@@ -42,6 +42,56 @@
     let isFetchingProxies = false;
     let isRankingProxies = false;
 
+    // Paid / private proxies (auth OK). Comma-separated or newline-separated.
+    // Example: ARRAS_PROXY_URL='http://user:pass@gate.example.com:9001'
+    // Or put one proxy per line in proxies.txt next to server.js
+    function loadCustomProxies() {
+        const out = [];
+        const env = process.env.ARRAS_PROXY_URL || process.env.ARRAS_PROXIES || "";
+        for (const part of env.split(/[\n,]+/)) {
+            const u = part.trim();
+            if (!u) continue;
+            out.push(
+                /^(https?|socks5?h?):\/\//i.test(u) ? u : `http://${u}`
+            );
+        }
+        try {
+            const fs = require("fs");
+            const path = require("path");
+            const file = process.env.ARRAS_PROXY_FILE || path.join(__dirname, "proxies.txt");
+            if (fs.existsSync(file)) {
+                const text = fs.readFileSync(file, "utf8");
+                for (const line of text.split(/\r?\n/)) {
+                    const u = line.trim();
+                    if (!u || u.startsWith("#")) continue;
+                    out.push(
+                        /^(https?|socks5?h?):\/\//i.test(u) ? u : `http://${u}`
+                    );
+                }
+            }
+        } catch {}
+        return [...new Set(out)];
+    }
+
+    const CUSTOM_PROXIES = loadCustomProxies();
+
+    function proxyTypeFor(url) {
+        const u = String(url || "").toLowerCase();
+        if (u.startsWith("socks5://") || u.startsWith("socks://") || u.startsWith("socks5h://")) return "socks5";
+        return "http";
+    }
+
+    function normalizeProxyUrl(url) {
+        const u = String(url || "").trim();
+        if (!u) return u;
+        if (/^https?:\/\//i.test(u) || /^socks5?h?:\/\//i.test(u)) return u;
+        return "http://" + u;
+    }
+
+    const USE_ONLY_CUSTOM = process.env.ARRAS_PROXY_ONLY === "1" || CUSTOM_PROXIES.length > 0 && process.env.ARRAS_PROXY_ONLY !== "0";
+    // Default: if custom proxies are set, use ONLY those (skip free scrape).
+    // Set ARRAS_PROXY_ONLY=0 to merge custom + free lists.
+
     const PROXY_SOURCES = [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&country=all&ssl=all&anonymity=all",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
@@ -80,7 +130,15 @@
         if (isFetchingProxies) return;
         isFetchingProxies = true;
 
-        const all = new Set();
+        const all = new Set(CUSTOM_PROXIES);
+
+        // Custom-only mode: never wipe pool with free lists
+        if (CUSTOM_PROXIES.length && process.env.ARRAS_PROXY_ONLY !== "0") {
+            PROXY_POOL = CUSTOM_PROXIES.slice();
+            rawLog(`[proxies] using ${PROXY_POOL.length} custom proxy(ies) (ARRAS_PROXY_URL / proxies.txt)`);
+            isFetchingProxies = false;
+            return;
+        }
 
         try {
             await Promise.allSettled(
@@ -106,6 +164,9 @@
 
             // Only swap the live pool when the fetch actually found something —
             // a bad network moment must not wipe the pool entirely.
+            // Always keep custom proxies in the pool when merging
+            for (const c of CUSTOM_PROXIES) all.add(c);
+
             if (all.size) {
                 PROXY_POOL = Array.from(all).slice(0, MAX_PROXIES);
 
@@ -114,7 +175,7 @@
                     [PROXY_POOL[i], PROXY_POOL[j]] = [PROXY_POOL[j], PROXY_POOL[i]];
                 }
 
-                rawLog(`[proxies] refetched pool (${PROXY_POOL.length})`);
+                rawLog(`[proxies] refetched pool (${PROXY_POOL.length}) custom=${CUSTOM_PROXIES.length}`);
             }
         } finally {
             isFetchingProxies = false;
@@ -325,6 +386,12 @@
                         } catch {}
                     }
                 }
+            } else if (message.type === "log") {
+                const id = message.id || "?";
+                const msg = message.message || "";
+                if (id === "turnstile" || process.env.ARRAS_VERBOSE_LOGS === "1") {
+                    rawLog(`[${id}] ${msg}`);
+                }
             }
         });
 
@@ -391,6 +458,61 @@
         return worker;
     }
 
+
+    // Central Turnstile queue — avoids 50 workers hammering 3 browser solvers
+    let tsRequestToken = null;
+    let tsInFlight = 0;
+    const tsWait = [];
+    const TS_MAX = Math.max(1, parseInt(process.env.TURNSTILE_CONCURRENCY || "3", 10) || 3);
+    try {
+        if (process.env.TURNSTILE_SERVER) {
+            tsRequestToken = require("./turnstile-client.js").requestTurnstileToken;
+        }
+    } catch (e) {
+        rawLog(`[turnstile] main client load fail: ${e.message}`);
+    }
+
+    function tsPump() {
+        while (tsRequestToken && tsInFlight < TS_MAX && tsWait.length) {
+            const job = tsWait.shift();
+            tsInFlight++;
+            tsRequestToken({
+                serverUrl: process.env.TURNSTILE_SERVER,
+                timeoutMs: parseInt(process.env.TURNSTILE_TIMEOUT || "90000", 10) || 90000
+            })
+                .then((r) => {
+                    tsInFlight--;
+                    job.resolve(r && r.token ? r.token : null);
+                    tsPump();
+                })
+                .catch((e) => {
+                    tsInFlight--;
+                    rawLog(`[turnstile] ${e.message}`);
+                    if (job.tries < 6 && /no solvers/i.test(String(e.message || ""))) {
+                        job.tries++;
+                        setTimeout(() => {
+                            tsWait.push(job);
+                            tsPump();
+                        }, 2000 + job.tries * 400);
+                    } else {
+                        job.resolve(null);
+                    }
+                    tsPump();
+                });
+        }
+    }
+
+    function acquireTurnstileToken() {
+        if (!tsRequestToken) return Promise.resolve(null);
+        return new Promise((resolve) => {
+            tsWait.push({ resolve, tries: 0 });
+            if (tsWait.length === 1 || tsWait.length % 10 === 0) {
+                rawLog(`[turnstile] queue=${tsWait.length} inflight=${tsInFlight}/${TS_MAX}`);
+            }
+            tsPump();
+        });
+    }
+
     function spawnBotNow(session, hash, botName, isDefender) {
         // Global farm cap — an "#F 1500" style request breaks out here instead
         // of silently spawning past the target.
@@ -440,12 +562,10 @@
             spawnHash = followHash ? "#" + String(followHash).replace(/^#/, "") : "#";
         }
 
-        worker.send({
-            type: "start",
-            config: {
+        const startConfig = {
                 id: botId,
                 proxy: proxyUrl
-                    ? { type: "http", url: proxyUrl }
+                    ? { type: proxyTypeFor(proxyUrl), url: proxyUrl }
                     : null,
                 hash: spawnHash,
                 name: botName,
@@ -463,9 +583,6 @@
                     tank: selectedTank,
                     isDefender: !!isDefender,
                     buildOverride: session.botBuild || "",
-                    // Seed new spawns with the latest known operator
-                    // position so they steer immediately instead of
-                    // idling until the next A (position) packet arrives.
                     ...(session.lastA ? {
                         x: session.lastA.payload.x,
                         y: session.lastA.payload.y,
@@ -480,21 +597,31 @@
                 reconnectDelay: 12000,
                 arrasCache: arrasScriptCache,
                 wasmCache: arrasWasmCache,
-                teamColor: session.teamColor
+                teamColor: session.teamColor,
+                turnstileToken: null
+            };
+
+        // Queue token on main thread (max TS_MAX concurrent), then start bot
+        acquireTurnstileToken().then((tok) => {
+            if (tok) {
+                startConfig.turnstileToken = tok;
+                rawLog(`[turnstile] token for bot ${botId}: ${tok.slice(0, 14)}…`);
+            } else if (process.env.TURNSTILE_SERVER) {
+                rawLog(`[turnstile] no token for bot ${botId} — starting anyway`);
+            }
+            try {
+                worker.send({ type: "start", config: startConfig });
+                if (session.lastA) {
+                    worker.send(
+                        isDefender
+                            ? session.lastA.defenderPayload
+                            : session.lastA.payload
+                    );
+                }
+            } catch (e) {
+                rawLog(`[turnstile] start send fail bot ${botId}: ${e.message}`);
             }
         });
-
-        // Push the cached position to this worker right away. The bot just
-        // spawned with the same coords in initialTarget, and this live
-        // update guarantees every bot on the worker (old and new) has a
-        // target heading so WASD triggers immediately.
-        if (session.lastA) {
-            worker.send(
-                isDefender
-                    ? session.lastA.defenderPayload
-                    : session.lastA.payload
-            );
-        }
 
         totalSpawned++;
         activeBotCount++;

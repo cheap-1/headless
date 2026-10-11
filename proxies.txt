@@ -1,0 +1,1 @@
+socks5h://customer-jp-fmybq755m-cc-rand-iptype-cellular:9qR5uUtUFWB7@gate.joyproxy.com:9001

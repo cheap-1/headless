@@ -1,19 +1,7 @@
 /**
- * Receiver client for Lucrehulk cloudflare-turnstile-solver-2026 token server.
- *
- * Protocol (binary, little-endian) — receiver side only:
- *   Request solve:  [1, solver_idx u32, ua_len u8, ua..., (name_len u8, name..., val_len u8, val...)*]
- *   Token reply:    [solver_idx u32, token_bytes...]  OR length 4 = fail, length 1 = [0] no solvers
- *   Solvers count:  send [3] → reply [count u32, 0]
- *
- * The actual browser solvers + Rust token-server + clicker must run separately
- * (GUI machine). This module only *requests* tokens.
- *
- * Env:
- *   TURNSTILE_SERVER   ws://host:8080
- *   TURNSTILE_TIMEOUT  ms (default 45000)
+ * Receiver client for Lucrehulk token-server protocol.
+ * Env: TURNSTILE_SERVER, TURNSTILE_TIMEOUT, TURNSTILE_CONCURRENCY
  */
-
 const { WebSocket } = require("ws");
 
 function u32le(n) {
@@ -48,19 +36,15 @@ function buildSolveRequest({ solverIdx = 0, userAgent = "", fields = {} } = {}) 
   ]);
 }
 
-/**
- * Request one Turnstile token from the token server.
- * @returns {Promise<{ token: string, solverIdx: number }>}
- */
-function requestTurnstileToken(options = {}) {
+function requestTurnstileTokenOnce(options = {}) {
   const serverUrl =
     options.serverUrl ||
     process.env.TURNSTILE_SERVER ||
     "ws://127.0.0.1:8080";
   const timeoutMs =
     options.timeoutMs ||
-    parseInt(process.env.TURNSTILE_TIMEOUT || "45000", 10) ||
-    45000;
+    parseInt(process.env.TURNSTILE_TIMEOUT || "60000", 10) ||
+    60000;
   const solverIdx = options.solverIdx || 0;
   const userAgent = options.userAgent || "";
   const fields = options.fields || {};
@@ -104,20 +88,25 @@ function requestTurnstileToken(options = {}) {
 
     ws.on("message", (data) => {
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      // No solvers available
-      if (buf.length === 1 && buf[0] === 0) {
+
+      // Solvers unavailable: single byte 0 (or any 1-byte packet)
+      if (buf.length === 1) {
         return fail(new Error("turnstile: no solvers available"));
       }
-      // Available-solvers response (ignore if we didn't ask) length 5
+      // Available-solvers response length 5
       if (buf.length === 5 && buf[4] === 0) {
         return;
       }
-      // Failed solve: only solver_idx, no token
+      // Failed solve: only solver_idx
       if (buf.length === 4) {
         return fail(new Error("turnstile: solver returned empty token"));
       }
-      if (buf.length < 4) {
-        return fail(new Error(`turnstile: unexpected packet len=${buf.length}`));
+      if (buf.length < 5) {
+        return fail(
+          new Error(
+            `turnstile: unexpected packet len=${buf.length} hex=${buf.toString("hex")}`
+          )
+        );
       }
       const idx = buf.readUInt32LE(0);
       const token = buf.slice(4).toString("utf8");
@@ -134,9 +123,52 @@ function requestTurnstileToken(options = {}) {
   });
 }
 
-/**
- * Query how many solvers are currently available.
- */
+// Limit parallel solves — Lucrehulk only has as many browser solvers as you opened
+const MAX_IN_FLIGHT = Math.max(
+  1,
+  parseInt(process.env.TURNSTILE_CONCURRENCY || "2", 10) || 2
+);
+let inFlight = 0;
+const waitQueue = [];
+
+function pumpQueue() {
+  while (inFlight < MAX_IN_FLIGHT && waitQueue.length) {
+    const job = waitQueue.shift();
+    inFlight++;
+    requestTurnstileTokenOnce(job.options)
+      .then((r) => {
+        inFlight--;
+        job.resolve(r);
+        pumpQueue();
+      })
+      .catch((e) => {
+        inFlight--;
+        // Retry once after short delay if no solvers
+        if (
+          job.retries < 4 &&
+          e &&
+          /no solvers available/i.test(String(e.message || e))
+        ) {
+          job.retries++;
+          setTimeout(() => {
+            waitQueue.push(job);
+            pumpQueue();
+          }, 1500 + job.retries * 500);
+        } else {
+          job.reject(e);
+        }
+        pumpQueue();
+      });
+  }
+}
+
+function requestTurnstileToken(options = {}) {
+  return new Promise((resolve, reject) => {
+    waitQueue.push({ options, resolve, reject, retries: 0 });
+    pumpQueue();
+  });
+}
+
 function getAvailableSolvers(serverUrl) {
   const url = serverUrl || process.env.TURNSTILE_SERVER || "ws://127.0.0.1:8080";
   return new Promise((resolve, reject) => {

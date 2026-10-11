@@ -18,23 +18,43 @@
   const path = await import('path');
   const ipc = parentPort || process;
 
-  // Cloudflare Turnstile token receiver (Lucrehulk token-server protocol).
-  // Requires external GUI solvers + Rust token-server running.
-  // Set TURNSTILE_SERVER=ws://host:8080 to enable.
+  // Cloudflare Turnstile — needs TURNSTILE_SERVER env (ws:// or wss://)
   let requestTurnstileToken = null;
+  const TURNSTILE_SERVER_URL = process.env.TURNSTILE_SERVER || "";
   try {
-    if (process.env.TURNSTILE_SERVER) {
-      const tc = require('./turnstile-client.js');
+    if (TURNSTILE_SERVER_URL) {
+      const pathMod = await import("path");
+      const { pathToFileURL } = await import("url");
+      const clientPath = pathMod.join(__dirname, "turnstile-client.js");
+      // CJS require from worker file directory
+      const { createRequire } = await import("module");
+      const requireFromWorker = createRequire(pathToFileURL(pathMod.join(__dirname, "index.js")).href);
+      const tc = requireFromWorker(clientPath);
       requestTurnstileToken = tc.requestTurnstileToken;
     }
   } catch (e) {
-    /* optional module */
+    const errMsg = e && e.message ? e.message : String(e);
+    setTimeout(() => {
+      try {
+        sendParent({ type: "log", id: "turnstile", message: "client load fail: " + errMsg });
+      } catch {}
+    }, 1000);
   }
 
   async function fetchTurnstileToken(fields = {}) {
-    if (!requestTurnstileToken) return null;
+    if (!requestTurnstileToken) {
+      try {
+        sendParent({
+          type: "log",
+          id: "turnstile",
+          message: "no client (env=" + (TURNSTILE_SERVER_URL ? TURNSTILE_SERVER_URL.slice(0, 32) : "missing") + ")"
+        });
+      } catch {}
+      return null;
+    }
     try {
       const res = await requestTurnstileToken({
+        serverUrl: TURNSTILE_SERVER_URL,
         fields,
         userAgent: process.env.TURNSTILE_UA || "",
         solverIdx: parseInt(process.env.TURNSTILE_SOLVER_IDX || "0", 10) || 0,
@@ -42,7 +62,9 @@
       });
       return res && res.token ? res.token : null;
     } catch (e) {
-      try { sendParent({ type: 'log', id: 'turnstile', message: 'token fail: ' + (e && e.message) }); } catch {}
+      try {
+        sendParent({ type: "log", id: "turnstile", message: "token fail: " + (e && e.message) });
+      } catch {}
       return null;
     }
   }
@@ -993,9 +1015,10 @@
 
       let proxyAgent = null;
       if (config.proxy) {
-        if (config.proxy.type === 'socks') {
+        const pt = String(config.proxy.type || '').toLowerCase();
+        if (pt === 'socks' || pt === 'socks5' || pt === 'socks5h' || /^socks/i.test(config.proxy.url || '')) {
           proxyAgent = new SocksProxyAgent(config.proxy.url);
-        } else if (config.proxy.type === 'http') {
+        } else {
           proxyAgent = new HttpsProxyAgent(config.proxy.url);
         }
       }
@@ -1315,31 +1338,55 @@ const mainInterval = setInterval(function () {
     if (a) {
           switch (i) {
             case 1: {
-              // Optional Turnstile: pull a pre-solved token and inject before Play
-              if (requestTurnstileToken && !global.__turnstileInjected) {
-                global.__turnstileInjected = true;
-                fetchTurnstileToken({
-                  action: process.env.TURNSTILE_ACTION || ""
-                }).then((tok) => {
-                  if (!tok) return;
-                  try {
-                    const doc = global.document;
-                    if (doc) {
-                      let input = doc.querySelector('[name="cf-turnstile-response"]');
-                      if (!input) {
-                        input = doc.createElement('input');
-                        input.type = 'hidden';
-                        input.name = 'cf-turnstile-response';
-                        (doc.body || doc.documentElement).appendChild(input);
+              // Turnstile: must have token before Play when TURNSTILE_SERVER is set
+              if (requestTurnstileToken) {
+                if (!config.__tsToken && !config.__tsPending) {
+                  config.__tsPending = true;
+                  statusLog('turnstile: requesting token...');
+                  sendParent({ type: 'log', id: 'turnstile', message: 'requesting token for bot ' + config.id });
+                  fetchTurnstileToken({
+                    action: process.env.TURNSTILE_ACTION || ""
+                  }).then((tok) => {
+                    config.__tsPending = false;
+                    if (!tok) {
+                      statusLog('turnstile: NO TOKEN');
+                      sendParent({ type: 'log', id: 'turnstile', message: 'NO TOKEN for bot ' + config.id });
+                      return;
+                    }
+                    config.__tsToken = tok;
+                    try {
+                      const doc = global.document;
+                      if (doc) {
+                        let input = doc.querySelector('[name="cf-turnstile-response"]');
+                        if (!input) {
+                          input = doc.createElement('input');
+                          input.type = 'hidden';
+                          input.name = 'cf-turnstile-response';
+                          (doc.body || doc.documentElement).appendChild(input);
+                        }
+                        input.value = tok;
                       }
-                      input.value = tok;
-                    }
-                    if (typeof global.turnstileCallback === 'function') {
-                      global.turnstileCallback(tok);
-                    }
-                    sendParent({ type: 'log', id: 'turnstile', message: 'token injected (' + tok.slice(0, 12) + '…)' });
-                  } catch (e) {}
-                }).catch(() => {});
+                      global.__turnstileToken = tok;
+                      if (typeof global.turnstileCallback === 'function') {
+                        global.turnstileCallback(tok);
+                      }
+                      if (global.turnstile && typeof global.turnstile.render === 'function') {
+                        /* token already obtained from external solver */
+                      }
+                    } catch (e) {}
+                    statusLog('turnstile: token ok');
+                    sendParent({ type: 'log', id: 'turnstile', message: 'token ok bot ' + config.id + ' ' + tok.slice(0, 16) + '…' });
+                  }).catch((e) => {
+                    config.__tsPending = false;
+                    sendParent({ type: 'log', id: 'turnstile', message: 'token error bot ' + config.id + ': ' + (e && e.message) });
+                  });
+                  break; // wait for next tick
+                }
+                if (config.__tsPending) break; // still waiting
+                if (!config.__tsToken) {
+                  // failed once — still try play so farm is not stuck forever
+                  statusLog('turnstile: playing without token');
+                }
               }
               setValue(config.name)
               controller.press("Enter")
@@ -1833,12 +1880,25 @@ const mainInterval = setInterval(function () {
       });
     } else if (message.type === 'start') {
       const config = message.config;
+      try {
+        sendParent({
+          type: 'log',
+          id: 'turnstile',
+          message: 'worker start bot=' + config.id + ' client=' + !!requestTurnstileToken + ' env=' + (TURNSTILE_SERVER_URL ? 'yes' : 'no')
+        });
+      } catch {}
       options.token = config.token;
       options.loadFromCache = config.loadFromCache;
       options.cache = config.cache;
       options.arrasCache = config.arrasCache;
       options.wasmCache = config.wasmCache;
 
+      // Token may already be on config from main-process queue
+      if (config.turnstileToken) {
+        config.__tsToken = config.turnstileToken;
+        global.__turnstileToken = config.turnstileToken;
+        sendParent({ type: 'log', id: 'turnstile', message: 'got token from main bot ' + config.id + ' ' + String(config.turnstileToken).slice(0, 16) + '…' });
+      }
       arras.then(function () {
         currentBotInterface = arras.create(config);
       });
